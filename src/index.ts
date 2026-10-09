@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -8,7 +9,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  *
  * - Fetches the model list from GET {BASE}/v1/models and registers them as the
  *   "sub2api" provider, picking the wire protocol per model (see PROTOCOL below).
- * - Registers a /usage command backed by GET {BASE}/v1/usage (balance and cost).
+ * - Registers a /usage command backed by GET {BASE}/v1/usage (limits, balance and cost).
  *
  * Configuration lives entirely in ~/.pi/agent/auth.json under the provider name
  * "sub2api" (no shell env exports needed):
@@ -153,12 +154,12 @@ function describeErrorBody(body: string): string {
   return text.length > 400 ? `${text.slice(0, 400)}…` : text;
 }
 
-async function fetchJson(url: string, key: string, timeoutMs = 8000): Promise<any> {
+async function fetchJson(url: string, key: string, timeoutMs = 8000, signal?: AbortSignal): Promise<any> {
   let res: Response;
   try {
     res = await fetch(url, {
       headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
     // Network-level failure (DNS, refused connection, timeout): name the endpoint too.
@@ -249,10 +250,24 @@ function resolveModelSpec(id: string, mode: ProtocolMode): ModelSpec {
 }
 
 // Render the GET /v1/usage response as a compact multi-line report.
-function formatUsage(data: any): string {
+export function formatUsage(data: any): string {
   const lines = ["sub2api usage"];
   const row = (label: string, rest: string) => lines.push(`  ${label.padEnd(7)}  ${rest}`);
   const num = (v: unknown) => Number(v ?? 0);
+  if (data?.subscription) {
+    if (data.planName) row("plan", String(data.planName));
+    for (const window of ["daily", "weekly", "monthly"] as const) {
+      const limit: unknown = data.subscription[`${window}_limit_usd`];
+      if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) continue;
+      const used: unknown = data.subscription[`${window}_usage_usd`];
+      if (typeof used !== "number" || !Number.isFinite(used) || used < 0) {
+        row(window, `usage unavailable . $${limit.toFixed(2)} limit`);
+        continue;
+      }
+      const remaining = Math.max(0, limit - used);
+      row(window, `$${used.toFixed(2)} / $${limit.toFixed(2)} used . $${remaining.toFixed(2)} remaining (${(remaining / limit * 100).toFixed(1)}%)`);
+    }
+  }
   if (data?.balance != null) {
     row("balance", `${num(data.balance).toFixed(2)}${data.unit ? ` ${data.unit}` : ""}`);
   }
@@ -273,6 +288,60 @@ function formatUsage(data: any): string {
   return lines.join("\n");
 }
 
+type ModelId = { id: string };
+
+function parseModels(data: unknown): ModelId[] {
+  if (!Array.isArray(data)) throw new Error("invalid model list");
+  const ids = data.filter((m): m is ModelId => typeof m?.id === "string" && m.id.trim().length > 0)
+    .map((m) => m.id).filter((id) => !/embedding|image/i.test(id));
+  return [...new Set(ids)].map((id) => ({ id }));
+}
+
+/** Cache only model IDs, scoped to the full configuration; never persist credentials. */
+export async function discoverModels(options: {
+  dir: string; base: string; key: string; protocol: ProtocolMode;
+  fetchModels: (timeoutMs: number, signal?: AbortSignal) => Promise<unknown>;
+}): Promise<{ models: ModelId[]; cached: boolean; refresh: (signal?: AbortSignal) => Promise<void> }> {
+  const digest = createHash("sha256").update(JSON.stringify([options.base, options.key, options.protocol])).digest("hex");
+  const cacheDir = join(options.dir, "sub2api-models");
+  const cachePath = join(cacheDir, `${digest}.json`);
+  const save = (models: ModelId[]) => {
+    const temporary = `${cachePath}.${randomUUID()}.tmp`;
+    try {
+      mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+      writeFileSync(temporary, JSON.stringify({ version: 1, models }), { mode: 0o600, flag: "wx" });
+      renameSync(temporary, cachePath);
+    } catch (err) {
+      console.warn(`[sub2api] model cache write failed: ${(err as Error).message}`);
+    } finally {
+      try { rmSync(temporary, { force: true }); }
+      catch (err) { console.warn(`[sub2api] model cache cleanup failed: ${(err as Error).message}`); }
+    }
+  };
+  const fetchModels = async (timeout: number, signal?: AbortSignal) => {
+    const response = await options.fetchModels(timeout, signal) as { data?: unknown } | null;
+    const models = parseModels(response?.data);
+    if (!models.length) throw new Error("model discovery returned no usable models");
+    // An obsolete runtime must not publish after shutdown/reload.
+    signal?.throwIfAborted();
+    save(models);
+    return models;
+  };
+  const refresh = async (signal?: AbortSignal) => { await fetchModels(8000, signal); };
+  try {
+    const cache = JSON.parse(readFileSync(cachePath, "utf8"));
+    if (cache.version !== 1) throw new Error("unsupported model cache version");
+    const models = parseModels(cache.models);
+    if (!models.length) throw new Error("empty model cache");
+    return { models, cached: true, refresh };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`[sub2api] model cache unavailable: ${(err as Error).message}`);
+    }
+  }
+  return { models: await fetchModels(2000), cached: false, refresh };
+}
+
 export default async function (pi: ExtensionAPI) {
   const { key, base, protocol: protocolMode } = readSub2apiCredential();
 
@@ -281,12 +350,28 @@ export default async function (pi: ExtensionAPI) {
     console.warn(`[sub2api] no API key found — set auth.json["sub2api"].key or $SUB2API_KEY; requests to ${modelsUrl} will be unauthenticated.`);
   }
 
-  let models: Array<{ id: string }> = [];
+  let models: ModelId[] = [];
   let fetchFailed = false;
   try {
-    const json = await fetchJson(modelsUrl, key);
-    // Keep chat-capable models only; drop embeddings and image-generation models.
-    models = ((json?.data as Array<{ id: string }>) ?? []).filter((m) => !/embedding|image/i.test(m.id));
+    const discovery = await discoverModels({
+      dir: agentDir(), base, key, protocol: protocolMode,
+      fetchModels: (timeout, signal) => fetchJson(modelsUrl, key, timeout, signal),
+    });
+    models = discovery.models;
+    if (discovery.cached) {
+      let controller: AbortController | undefined;
+      let started = false;
+      pi.on("session_start", () => {
+        if (started) return;
+        started = true;
+        controller = new AbortController();
+        const signal = controller.signal;
+        void discovery.refresh(signal).catch((err: Error) => {
+          if (!signal.aborted) console.warn(`[sub2api] background model refresh failed (keeping cache): ${err.message}`);
+        });
+      });
+      pi.on("session_shutdown", () => { controller?.abort(); });
+    }
   } catch (err) {
     fetchFailed = true;
     console.warn(`[sub2api] models fetch failed: ${(err as Error).message}`);
@@ -340,7 +425,7 @@ export default async function (pi: ExtensionAPI) {
 
   // /usage: sub2api tracks authoritative cost/balance at GET /v1/usage (same key).
   pi.registerCommand("usage", {
-    description: "Show sub2api balance and today/total cost",
+    description: "Show sub2api subscription limits, balance and today/total cost",
     handler: async (_args, ctx) => {
       if (!key) {
         ctx.ui.notify("sub2api: no API key in auth.json", "error");

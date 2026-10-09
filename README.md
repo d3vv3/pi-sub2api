@@ -176,6 +176,23 @@ pi --list-models
 After forcing, only one side should remain. Note that this line is only readable in
 `--list-models` and print mode — the interactive TUI clears the screen as it starts.
 
+### Startup model cache
+
+After the first successful discovery, model IDs are cached under
+`~/.pi/agent/sub2api-models/` (or `PI_CODING_AGENT_DIR/sub2api-models/`). The cache
+is scoped to the gateway, API key and protocol using a hash; credentials are not stored.
+
+Cached startup registers models immediately without waiting for the gateway. Once a
+session starts, a non-blocking refresh updates the cache for the **next launch or reload**;
+the active catalog is left unchanged. Refresh errors or empty results retain the last
+working list. `--list-models` uses the cache without starting a refresh.
+
+First-time discovery, or a changed configuration, waits at most 2 seconds for the request
+(instead of 8). If that fails, the provider is skipped as before. Delete the matching cache
+file (or the cache directory) to force discovery; a cached list can otherwise remain stale
+while the gateway is unavailable. Cache write failures are logged but do not prevent
+registration. No model cache is included in the package.
+
 ## Use
 
 ```bash
@@ -184,7 +201,21 @@ pi --provider sub2api --model gpt-5.5
 pi --provider sub2api --model claude-opus-4-7
 ```
 
-In an interactive session, `/usage` prints balance and cost:
+In an interactive session, `/usage` prints enabled subscription limits, balance and cost.
+For a subscription, only daily/weekly/monthly windows with a positive limit are shown:
+
+```
+sub2api usage
+  plan     open ai 25 % devve
+  weekly   $286.86 / $400.00 used . $113.14 remaining (28.3%)
+```
+
+Null or zero limits are hidden. Unused enabled limits are still shown; exhausted limits
+show zero remaining. Reset times are not inferred. The same inference API key is used,
+with no dashboard login needed. If the gateway returns key-specific quota/rate limits
+instead of a subscription breakdown, subscription rows are unavailable.
+
+Existing balance and cost reporting is unchanged:
 
 ```
 sub2api usage
@@ -219,14 +250,17 @@ sub2api usage
 ```bash
 npm install
 npm run check          # tsc --noEmit
+npm test               # usage formatting and model cache regressions
 npm run pack:dry-run   # what would ship
 ```
 
-There is no build step and no test suite. The package ships TypeScript, which pi loads
+There is no build step. The package ships TypeScript, which pi loads
 through jiti, so `pi -e /path/to/pi-sub2api` runs a checkout exactly as an installed copy
-runs. The extension is one file: `src/index.ts`.
+runs. The extension is one file: `src/index.ts`. The formatter tests transpile it without
+executing the extension factory or reading credentials. Model-cache tests use synthetic
+keys and isolated temporary directories.
 
-Typechecking is the only automated gate, and it is worth saying what that does not cover.
+Typechecking and formatter tests are automated gates, but do not cover live gateway behavior.
 Everything interesting here is a claim about a live gateway — which protocol a key's
 platform serves natively, what `/v1/models` omits, which `reasoning_effort` values the
 upstream rejects — and none of it can be verified without pointing the extension at a real
