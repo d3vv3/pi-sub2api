@@ -265,7 +265,7 @@ export function formatUsage(data: any): string {
         continue;
       }
       const remaining = Math.max(0, limit - used);
-      row(window, `$${used.toFixed(2)} / $${limit.toFixed(2)} used . $${remaining.toFixed(2)} remaining (${(remaining / limit * 100).toFixed(1)}%)`);
+      row(window, `$${used.toFixed(2)} / $${limit.toFixed(2)} used | $${remaining.toFixed(2)} remaining (${(remaining / limit * 100).toFixed(1)}%)`);
     }
   }
   if (data?.balance != null) {

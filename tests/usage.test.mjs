@@ -20,7 +20,7 @@ test("subscription report shows only enabled windows, including the live weekly 
     },
   });
   assert.match(output, /plan\s+open ai 25 % devve/);
-  assert.match(output, /weekly\s+\$286\.86 \/ \$400\.00 used . \$113\.14 remaining \(28\.3%\)/);
+  assert.match(output, /weekly\s+\$286\.86 \/ \$400\.00 used \| \$113\.14 remaining \(28\.3%\)/);
   assert.doesNotMatch(output, /daily|monthly|reset/i);
 });
 
@@ -30,9 +30,9 @@ test("all positive caps display, unused caps remain visible and exhausted caps c
     weekly_limit_usd: 20, weekly_usage_usd: 20,
     monthly_limit_usd: 30, monthly_usage_usd: 31,
   } });
-  assert.match(output, /daily\s+\$0\.00 \/ \$10\.00 used . \$10\.00 remaining \(100\.0%\)/);
-  assert.match(output, /weekly\s+\$20\.00 \/ \$20\.00 used . \$0\.00 remaining \(0\.0%\)/);
-  assert.match(output, /monthly\s+\$31\.00 \/ \$30\.00 used . \$0\.00 remaining \(0\.0%\)/);
+  assert.match(output, /daily\s+\$0\.00 \/ \$10\.00 used \| \$10\.00 remaining \(100\.0%\)/);
+  assert.match(output, /weekly\s+\$20\.00 \/ \$20\.00 used \| \$0\.00 remaining \(0\.0%\)/);
+  assert.match(output, /monthly\s+\$31\.00 \/ \$30\.00 used \| \$0\.00 remaining \(0\.0%\)/);
 });
 
 test("disabled or malformed subscription limits are not rendered as allowances", () => {

@@ -206,8 +206,8 @@ For a subscription, only daily/weekly/monthly windows with a positive limit are 
 
 ```
 sub2api usage
-  plan     open ai 25 % devve
-  weekly   $286.86 / $400.00 used . $113.14 remaining (28.3%)
+  plan     Example subscription
+  weekly   $286.86 / $400.00 used | $113.14 remaining (28.3%)
 ```
 
 Null or zero limits are hidden. Unused enabled limits are still shown; exhausted limits
