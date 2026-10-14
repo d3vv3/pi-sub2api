@@ -288,6 +288,141 @@ export function formatUsage(data: any): string {
   return lines.join("\n");
 }
 
+// Atelier's public v1 event protocol avoids a mandatory dependency on its TUI package.
+const SIDEBAR_CHANNEL = "pi-atelier:sidebar-panels";
+const SIDEBAR_ID = "sub2api:usage";
+type UsageRole = "muted" | "working" | "success" | "caution" | "warning" | "error";
+type UsageRow = { text: string; role?: UsageRole };
+
+type UsageKeyValue = { label: string; value: string; valueRole?: UsageRole };
+
+export function formatSubscriptionRows(data: any, now = Date.now()): UsageRow[] {
+  const keyValues = formatSubscriptionKeyValues(data, now);
+  if (!keyValues.length) return [{ text: "No subscription limits available", role: "muted" }];
+  const labelWidth = keyValues.length > 2 ? 13 : 9;
+  return keyValues.map(({ label, value, valueRole }) => ({
+    text: `${label.padEnd(labelWidth)}${value.padStart(7)}`,
+    // Older hosts keep their established plain-row presentation.
+    ...(valueRole === "muted" ? { role: valueRole } : {}),
+  }));
+}
+
+export function formatSubscriptionKeyValues(data: any, now = Date.now()): UsageKeyValue[] {
+  const windows = (["daily", "weekly", "monthly"] as const).filter((window) => {
+    const limit = data?.subscription?.[`${window}_limit_usd`];
+    return typeof limit === "number" && Number.isFinite(limit) && limit > 0;
+  });
+  const row = (label: string, percent: number | undefined, used = false): UsageKeyValue => ({
+    label,
+    value: percent === undefined ? "Unavailable" : `${percent.toFixed(1)}%`,
+    ...(percent === undefined ? { valueRole: "muted" as const }
+      : used ? { valueRole: (percent >= 90 ? "error" : percent >= 75 ? "warning"
+        : percent >= 50 ? "caution" : "success") as UsageRole } : {}),
+  });
+  return windows.flatMap((window) => {
+    const limit = data.subscription[`${window}_limit_usd`];
+    const used = data.subscription[`${window}_usage_usd`];
+    const usagePercent = typeof used === "number" && Number.isFinite(used) && used >= 0
+      ? used / limit * 100 : undefined;
+    // /v1/usage exposes the weekly anchor, but not daily/monthly reset boundaries.
+    // Do not infer those from subscription expiry, local midnight or calendar months.
+    const rawStart = data.subscription.weekly_window_start;
+    const start = typeof rawStart === "string" && /T.*(?:Z|[+-]\d{2}:\d{2})$/.test(rawStart)
+      ? Date.parse(rawStart) : NaN;
+    const timePercent = window === "weekly" && Number.isFinite(start) && Number.isFinite(now)
+      ? Math.max(0, Math.min(100, (now - start) / (7 * 24 * 60 * 60 * 1000) * 100)) : undefined;
+    return [
+      row(windows.length > 1 ? `${window} Used` : "Used", usagePercent, true),
+      row(windows.length > 1 ? `${window} Time` : "Time", timePercent),
+    ];
+  });
+}
+
+export function registerUsageSidebar(
+  pi: Pick<ExtensionAPI, "events" | "on">,
+  fetchUsage: (signal: AbortSignal) => Promise<any>,
+) {
+  const source = `sub2api-${randomUUID()}`;
+  let revision = 0;
+  let active = false;
+  let rows: UsageRow[] = [{ text: "Usage not fetched yet", role: "muted" }];
+  let keyValues: UsageKeyValue[] = [];
+  let unsubscribe: (() => void) | undefined;
+  let controller: AbortController | undefined;
+  let pending: Promise<any> | undefined;
+  const publish = (requestId?: string) => {
+    if (!active) return;
+    pi.events.emit(SIDEBAR_CHANNEL, {
+      version: 1, type: "register", source, revision: ++revision,
+      panel: { id: SIDEBAR_ID, title: "Sub2API", rows,
+        ...(keyValues.length ? { keyValues } : {}),
+      },
+      ...(requestId ? { requestId } : {}),
+    });
+  };
+  const refresh = (): Promise<any> => {
+    if (pending) return pending;
+    const current = new AbortController();
+    controller = current;
+    rows = [{ text: "Fetching usage...", role: "working" }];
+    keyValues = [];
+    publish();
+    pending = Promise.resolve().then(() => fetchUsage(current.signal)).then((data) => {
+      current.signal.throwIfAborted();
+      const now = Date.now();
+      rows = formatSubscriptionRows(data, now);
+      keyValues = formatSubscriptionKeyValues(data, now);
+      publish();
+      return data;
+    }).catch((error: unknown) => {
+      if (!current.signal.aborted) {
+        // Gateway error bodies and URLs may contain sensitive data: keep the panel generic.
+        rows = [{ text: "Usage unavailable - retry /usage", role: "warning" }];
+        keyValues = [];
+        publish();
+      }
+      throw error;
+    }).finally(() => {
+      if (controller === current) { pending = undefined; controller = undefined; }
+    });
+    return pending;
+  };
+  const refreshInBackground = () => {
+    // The failure is exposed in the panel; /usage retains the detailed notification.
+    void refresh().catch(() => undefined);
+  };
+  pi.on("session_start", (_event, ctx) => {
+    if (!ctx.hasUI || active) return;
+    active = true;
+    unsubscribe = pi.events.on(SIDEBAR_CHANNEL, (data: unknown) => {
+      const event = data as { version?: unknown; type?: unknown; requestId?: unknown } | null;
+      if (event?.version === 1 && event.type === "discover" &&
+          typeof event.requestId === "string" && event.requestId.trim() &&
+          event.requestId.length <= 256 && !/[\x00-\x1f\x7f-\x9f]/.test(event.requestId)) {
+        publish(event.requestId);
+      }
+    });
+    publish();
+    refreshInBackground();
+  });
+  pi.on("agent_end", (_event, ctx) => {
+    if (active && ctx.model?.provider === "sub2api") refreshInBackground();
+  });
+  pi.on("session_shutdown", () => {
+    controller?.abort();
+    controller = undefined;
+    pending = undefined;
+    if (!active) return;
+    active = false;
+    unsubscribe?.();
+    unsubscribe = undefined;
+    pi.events.emit(SIDEBAR_CHANNEL, {
+      version: 1, type: "unregister", source, revision: ++revision, id: SIDEBAR_ID,
+    });
+  });
+  return { refresh };
+}
+
 type ModelId = { id: string };
 
 function parseModels(data: unknown): ModelId[] {
@@ -423,6 +558,11 @@ export default async function (pi: ExtensionAPI) {
     .join(" | ");
   console.log(`[sub2api] registered ${specs.length} model(s) — ${summary}`);
 
+  const usage = registerUsageSidebar(pi, (signal) => {
+    if (!key) return Promise.reject(new Error("no API key in auth.json"));
+    return fetchJson(`${base}/v1/usage`, key, 8000, signal);
+  });
+
   // /usage: sub2api tracks authoritative cost/balance at GET /v1/usage (same key).
   pi.registerCommand("usage", {
     description: "Show sub2api subscription limits, balance and today/total cost",
@@ -433,7 +573,7 @@ export default async function (pi: ExtensionAPI) {
       }
       ctx.ui.notify("Fetching sub2api usage…", "info");
       try {
-        const data = await fetchJson(`${base}/v1/usage`, key);
+        const data = await usage.refresh();
         ctx.ui.notify(formatUsage(data), "info");
       } catch (e) {
         ctx.ui.notify(`sub2api: usage unavailable — ${(e as Error).message}`, "warning");

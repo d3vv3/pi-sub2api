@@ -226,6 +226,43 @@ sub2api usage
     gpt-5.5  $0.27 · 52,300 tok · 4 req
 ```
 
+### Pi Atelier sidebar
+
+With [Pi Atelier](https://github.com/michaelmjhhhh/pi-atelier) loaded, enable the
+**Sub2API** panel in Atelier's **Settings -> Display**. New contributed panels start
+hidden. The panel (`sub2api:usage`) shows only the percentage spent of enabled
+subscription limits in aligned label/value columns. A single enabled limit uses
+`Used` and `Time`; multiple limits prefix those labels with `daily`, `weekly`,
+and `monthly`. `Time` is the straight-line spending target: the percentage of the
+allowance period elapsed. Weekly timing uses the gateway's timezone-aware
+`subscription.weekly_window_start` over seven days, clamped to 0-100%. Missing or
+invalid timestamps show `Unavailable`. The public API does not expose daily/monthly
+reset boundaries, so their Time values also show `Unavailable`; no dates are guessed.
+Both values refresh when usage refreshes, rather than ticking on a timer. Percentages
+remain accurate above 100% for over-limit usage. The panel publishes optional
+`keyValues` so supporting Atelier versions align labels and values at the current
+sidebar width and reflow them on resize. Older Atelier versions retain the existing
+fixed-spacing plain-row fallback; no Atelier dependency is required.
+On supporting hosts, **Used** values are green below 50%, yellow from 50% to
+below 75%, orange from 75% to below 90%, and red at 90% and above. Thresholds use
+the unrounded usage percentage. **Time** stays neutral; unavailable values stay muted.
+Disabled limits are omitted and
+missing usage is shown as unavailable, not zero. Detailed amounts, balance, costs
+and model statistics remain in `/usage`. Atelier's public contributed-panel API
+has no compact/expanded state, so this panel always uses the compact presentation.
+
+Usage refreshes in the background at UI session start and after an agent run using
+the Sub2API provider. `/usage` also refreshes the panel; concurrent refreshes share
+one request. There is no polling timer. A failed refresh replaces the panel with a
+warning; run `/usage` to retry and see the detailed error. Gateway accounting may
+lag a just-completed request.
+
+The integration uses Atelier's public v1 event-bus protocol, so either extension
+can load first and Atelier is not a required dependency. Without Atelier, the
+extension continues working normally (UI sessions still refresh usage). No
+automatic usage requests are made in non-UI sessions. The panel is removed on
+shutdown or reload.
+
 ## Notes
 
 - **API type**: the OpenAI side defaults to `openai-completions`;
@@ -250,13 +287,13 @@ sub2api usage
 ```bash
 npm install
 npm run check          # tsc --noEmit
-npm test               # usage formatting and model cache regressions
+npm test               # usage formatting, model cache and sidebar regressions
 npm run pack:dry-run   # what would ship
 ```
 
 There is no build step. The package ships TypeScript, which pi loads
 through jiti, so `pi -e /path/to/pi-sub2api` runs a checkout exactly as an installed copy
-runs. The extension is one file: `src/index.ts`. The formatter tests transpile it without
+runs. The extension is one file: `src/index.ts`. The formatter and sidebar tests transpile it without
 executing the extension factory or reading credentials. Model-cache tests use synthetic
 keys and isolated temporary directories.
 
